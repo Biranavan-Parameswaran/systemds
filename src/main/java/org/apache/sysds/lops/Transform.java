@@ -175,7 +175,7 @@ public class Transform extends Lop
 			sb.append( ltmp.prepScalarInputOperand(getExecType()));
 		}
 		
-		//output
+		//output this is just a test for the GitHub action
 		sb.append( OPERAND_DELIMITOR );
 		sb.append( this.prepOutputOperand(output));
 		
