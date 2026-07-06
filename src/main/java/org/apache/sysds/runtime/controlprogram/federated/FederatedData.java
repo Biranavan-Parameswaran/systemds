@@ -34,6 +34,7 @@ import java.util.concurrent.Future;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
@@ -212,7 +213,12 @@ public class FederatedData {
 			ChannelFuture f = b.connect(address).sync();
 			Promise<FederatedResponse> promise = f.channel().eventLoop().newPromise();
 			handler.setPromise(promise);
-			f.channel().writeAndFlush(request);
+			f.channel().writeAndFlush(request).addListener((ChannelFutureListener) future -> {
+				if(!future.isSuccess()) {
+					LOG.error("Federated network write failed: " + future.cause().getMessage());
+					promise.setFailure(future.cause());
+				}
+			});
 
 			return handler.getProm();
 		}
@@ -316,6 +322,15 @@ public class FederatedData {
 		public void channelRead(ChannelHandlerContext ctx, Object msg) {
 			_prom.setSuccess((FederatedResponse) msg);
 			ctx.close();
+		}
+
+		@Override
+		public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+			// Fail (rather than leave hanging) any request whose connection closed before its response
+			// was delivered, so a waiting caller gets an exception instead of blocking until timeout.
+			if(_prom != null && !_prom.isDone())
+				_prom.tryFailure(new IOException("Channel closed before federated response was received"));
+			super.channelInactive(ctx);
 		}
 
 		public Promise<FederatedResponse> getProm() {
