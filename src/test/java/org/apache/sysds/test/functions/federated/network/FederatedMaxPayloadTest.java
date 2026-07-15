@@ -65,6 +65,12 @@ public class FederatedMaxPayloadTest extends AutomatedTestBase {
 		startLocalFedWorkerThread(port, 10);
 		InetSocketAddress address = new InetSocketAddress("localhost", port);
 
+		log("==== FED MAX PAYLOAD SWEEP ====");
+		log(String.format("rows %d..%d in %d steps (%d/step), cols=%d dense | maxCapacity=%,d | heap max=%s",
+			START_ROWS, END_ROWS, STEPS, STEPS == 0 ? 0 : (END_ROWS - START_ROWS) / STEPS, COLS,
+			Integer.MAX_VALUE, gib(Runtime.getRuntime().maxMemory())));
+		log("worker started on port " + port);
+
 		long lastPassBytes = -1;
 		int lastPassRows = -1;
 		long firstCrashBytes = -1;
@@ -77,17 +83,20 @@ public class FederatedMaxPayloadTest extends AutomatedTestBase {
 				long rawBytes = (long) rows * COLS * 8;
 				String sz = String.format("%d x %d dense = %,d raw bytes (%.4f GiB)", rows, COLS, rawBytes,
 					rawBytes / (1024.0 * 1024 * 1024));
+				long t0 = System.nanoTime();
 
+				log(String.format(">>> step %d/%d: %s | %s", i, STEPS, sz, heap()));
 				MatrixBlock mb = new MatrixBlock(rows, COLS, false);
 				mb.allocateDenseBlock();
 				mb.setNonZeros((long) rows * COLS);
 				FederatedRequest request = new FederatedRequest(FederatedRequest.RequestType.PUT_VAR, 1, mb);
+				log(String.format("    block allocated (%.1fs), sending PUT_VAR ... | %s", secs(t0), heap()));
 
 				try {
 					Future<FederatedResponse> f = FederatedData.executeFederatedOperation(address, request);
 					FederatedResponse response = f.get();
 					Assert.assertTrue("Network send was not successful @ " + sz, response.isSuccessful());
-					System.out.println("[sweep " + i + "] PASS  " + sz);
+					log(String.format("[sweep %d] PASS  %s (round-trip %.1fs)", i, sz, secs(t0)));
 					lastPassBytes = rawBytes;
 					lastPassRows = rows;
 				}
@@ -98,7 +107,7 @@ public class FederatedMaxPayloadTest extends AutomatedTestBase {
 						Assert.fail("OOM before the encoder overflow @ " + sz
 							+ " - raise the test-fork heap (pom argLine -Xmx) and rerun. " + msg);
 					if(msg.contains("exceeds maxCapacity")) {
-						System.out.println("[sweep " + i + "] CRASH " + sz + "  -> " + msg.trim());
+						log(String.format("[sweep %d] CRASH %s (%.1fs)  -> %s", i, sz, secs(t0), msg.trim()));
 						firstCrashBytes = rawBytes;
 						firstCrashRows = rows;
 						crashWriterIndex = parseWriterIndex(msg);
@@ -122,16 +131,16 @@ public class FederatedMaxPayloadTest extends AutomatedTestBase {
 			FederatedData.clearFederatedWorkers();
 		}
 
-		System.out.println("==== FED MAX PAYLOAD THRESHOLD (cols=" + COLS + ", maxCapacity=" + Integer.MAX_VALUE + ") ====");
-		System.out.println("  last  PASS : "
+		log("==== FED MAX PAYLOAD THRESHOLD (cols=" + COLS + ", maxCapacity=" + Integer.MAX_VALUE + ") ====");
+		log("  last  PASS : "
 			+ (lastPassRows < 0 ? "none" : lastPassRows + " rows, " + String.format("%,d", lastPassBytes) + " raw bytes"));
-		System.out.println("  first CRASH: "
+		log("  first CRASH: "
 			+ (firstCrashRows < 0 ? "none" : firstCrashRows + " rows, " + String.format("%,d", firstCrashBytes) + " raw bytes"));
 		if(crashWriterIndex > 0)
-			System.out.println("  crash writerIndex: " + String.format("%,d", crashWriterIndex)
+			log("  crash writerIndex: " + String.format("%,d", crashWriterIndex)
 				+ " (over cap by " + String.format("%,d", crashWriterIndex - Integer.MAX_VALUE) + " bytes at +1024 write)");
 		if(lastPassBytes > 0 && firstCrashBytes > 0)
-			System.out.println("  threshold raw-byte bracket: (" + String.format("%,d", lastPassBytes) + " , "
+			log("  threshold raw-byte bracket: (" + String.format("%,d", lastPassBytes) + " , "
 				+ String.format("%,d", firstCrashBytes) + "]");
 
 		Assert.assertTrue("Start size " + START_ROWS + " rows already crashed - lower fedMaxPayload.startRows",
@@ -143,5 +152,23 @@ public class FederatedMaxPayloadTest extends AutomatedTestBase {
 	private static long parseWriterIndex(String msg) {
 		Matcher m = WRITER_INDEX.matcher(msg);
 		return m.find() ? Long.parseLong(m.group(1)) : -1;
+	}
+
+	private static void log(String s) {
+		System.out.println(String.format("%tT [FedMaxPayload] %s", System.currentTimeMillis(), s));
+	}
+
+	private static String heap() {
+		Runtime rt = Runtime.getRuntime();
+		long used = rt.totalMemory() - rt.freeMemory();
+		return "heap used=" + gib(used) + "/" + gib(rt.maxMemory());
+	}
+
+	private static String gib(long bytes) {
+		return String.format("%.2fGiB", bytes / (1024.0 * 1024 * 1024));
+	}
+
+	private static double secs(long t0Nanos) {
+		return (System.nanoTime() - t0Nanos) / 1e9;
 	}
 }
