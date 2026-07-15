@@ -31,6 +31,8 @@ import org.junit.Test;
 import java.net.InetSocketAddress;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class FederatedMaxPayloadTest extends AutomatedTestBase {
 
@@ -38,50 +40,108 @@ public class FederatedMaxPayloadTest extends AutomatedTestBase {
 	private final static String TEST_DIR = "functions/federated/network/";
 	private final static String TEST_CLASS_DIR = TEST_DIR + FederatedMaxPayloadTest.class.getSimpleName() + "/";
 
+	// sweep bounds (override on the CLI, e.g. -DfedMaxPayload.endRows=9000). cols=30000 dense -> one row is
+	// 240KB, so the default 8850..8950 bracket (raw 2.124..2.148GB) straddles the Integer.MAX_VALUE cliff.
+	private final static int COLS = Integer.getInteger("fedMaxPayload.cols", 30000);
+	private final static int START_ROWS = Integer.getInteger("fedMaxPayload.startRows", 8850);
+	private final static int END_ROWS = Integer.getInteger("fedMaxPayload.endRows", 8950);
+	private final static int STEPS = Integer.getInteger("fedMaxPayload.steps", 10);
+
+	private final static Pattern WRITER_INDEX = Pattern.compile("writerIndex\\((\\d+)\\)");
+
 	@Override
 	public void setUp() {
 		addTestConfiguration(TEST_NAME, new TestConfiguration(TEST_CLASS_DIR, TEST_NAME, new String[] {""}));
 	}
 
+	/**
+	 * Ramp a dense PUT_VAR payload up in STEPS increments until the legacy ObjectEncoder overflows its
+	 * Integer.MAX_VALUE ByteBuf, and report the last size that passed and the first that crashed. That
+	 * bracket is the real wire-size threshold to calibrate STREAM_THRESHOLD against.
+	 */
 	@Test
-	public void testMaxNettyPayloadCrash() {
+	public void testMaxNettyPayloadThresholdSweep() {
 		int port = getRandomAvailablePort();
-		Thread worker = startLocalFedWorkerThread(port, 10);
+		startLocalFedWorkerThread(port, 10);
+		InetSocketAddress address = new InetSocketAddress("localhost", port);
+
+		long lastPassBytes = -1;
+		int lastPassRows = -1;
+		long firstCrashBytes = -1;
+		int firstCrashRows = -1;
+		long crashWriterIndex = -1;
 
 		try {
-			// 30000 x 8950 dense doubles = 2,148,000,000 raw bytes, ~516 KB over Integer.MAX_VALUE,
-			// so the legacy ObjectEncoder ByteBuf overflows while packing this single PUT_VAR.
-			int rows = 30000;
-			int cols = 8950;
-			MatrixBlock mb = new MatrixBlock(rows, cols, false);
-			mb.allocateDenseBlock();
-			mb.setNonZeros((long) rows * cols);
+			for(int i = 0; i <= STEPS; i++) {
+				int rows = START_ROWS + (int) ((long) (END_ROWS - START_ROWS) * i / STEPS);
+				long rawBytes = (long) rows * COLS * 8;
+				String sz = String.format("%d x %d dense = %,d raw bytes (%.4f GiB)", rows, COLS, rawBytes,
+					rawBytes / (1024.0 * 1024 * 1024));
 
-			InetSocketAddress address = new InetSocketAddress("localhost", port);
-			FederatedRequest request = new FederatedRequest(FederatedRequest.RequestType.PUT_VAR, 1, mb);
+				MatrixBlock mb = new MatrixBlock(rows, COLS, false);
+				mb.allocateDenseBlock();
+				mb.setNonZeros((long) rows * COLS);
+				FederatedRequest request = new FederatedRequest(FederatedRequest.RequestType.PUT_VAR, 1, mb);
 
-			Future<FederatedResponse> responseFuture = FederatedData.executeFederatedOperation(address, request);
-
-			FederatedResponse response = responseFuture.get();
-			Assert.assertTrue("Network send was not successful.", response.isSuccessful());
-		}
-		catch(ExecutionException e) {
-			String errorMsg = e.getMessage() != null ? e.getMessage() : "";
-			Throwable cause = e.getCause();
-			String causeMsg = cause != null && cause.getMessage() != null ? cause.getMessage() : "";
-			if(errorMsg.contains("exceeds maxCapacity") || causeMsg.contains("exceeds maxCapacity")) {
-				Assert.fail("Test failing: Max capacity of encoder exceeded." + errorMsg);
-			}
-			else {
-				Assert.fail("Test failed due to an unexpected execution exception: " + errorMsg);
+				try {
+					Future<FederatedResponse> f = FederatedData.executeFederatedOperation(address, request);
+					FederatedResponse response = f.get();
+					Assert.assertTrue("Network send was not successful @ " + sz, response.isSuccessful());
+					System.out.println("[sweep " + i + "] PASS  " + sz);
+					lastPassBytes = rawBytes;
+					lastPassRows = rows;
+				}
+				catch(ExecutionException e) {
+					String msg = (e.getMessage() != null ? e.getMessage() : "") + " | "
+						+ (e.getCause() != null && e.getCause().getMessage() != null ? e.getCause().getMessage() : "");
+					if(msg.contains("OutOfMemoryError"))
+						Assert.fail("OOM before the encoder overflow @ " + sz
+							+ " - raise the test-fork heap (pom argLine -Xmx) and rerun. " + msg);
+					if(msg.contains("exceeds maxCapacity")) {
+						System.out.println("[sweep " + i + "] CRASH " + sz + "  -> " + msg.trim());
+						firstCrashBytes = rawBytes;
+						firstCrashRows = rows;
+						crashWriterIndex = parseWriterIndex(msg);
+						break;
+					}
+					Assert.fail("Unexpected execution exception @ " + sz + ": " + msg);
+				}
+				finally {
+					mb = null;
+					request = null;
+					FederatedData.clearFederatedWorkers();
+					System.gc();
+				}
 			}
 		}
 		catch(Exception e) {
 			e.printStackTrace();
-			Assert.fail("Test failed due to network send exception: " + e.getMessage());
+			Assert.fail("Sweep failed due to network send exception: " + e.getMessage());
 		}
 		finally {
 			FederatedData.clearFederatedWorkers();
 		}
+
+		System.out.println("==== FED MAX PAYLOAD THRESHOLD (cols=" + COLS + ", maxCapacity=" + Integer.MAX_VALUE + ") ====");
+		System.out.println("  last  PASS : "
+			+ (lastPassRows < 0 ? "none" : lastPassRows + " rows, " + String.format("%,d", lastPassBytes) + " raw bytes"));
+		System.out.println("  first CRASH: "
+			+ (firstCrashRows < 0 ? "none" : firstCrashRows + " rows, " + String.format("%,d", firstCrashBytes) + " raw bytes"));
+		if(crashWriterIndex > 0)
+			System.out.println("  crash writerIndex: " + String.format("%,d", crashWriterIndex)
+				+ " (over cap by " + String.format("%,d", crashWriterIndex - Integer.MAX_VALUE) + " bytes at +1024 write)");
+		if(lastPassBytes > 0 && firstCrashBytes > 0)
+			System.out.println("  threshold raw-byte bracket: (" + String.format("%,d", lastPassBytes) + " , "
+				+ String.format("%,d", firstCrashBytes) + "]");
+
+		Assert.assertTrue("Start size " + START_ROWS + " rows already crashed - lower fedMaxPayload.startRows",
+			lastPassRows > 0 || firstCrashRows < 0);
+		Assert.assertTrue("No overflow observed up to " + END_ROWS + " rows x " + COLS
+			+ " - raise fedMaxPayload.endRows", firstCrashRows > 0);
+	}
+
+	private static long parseWriterIndex(String msg) {
+		Matcher m = WRITER_INDEX.matcher(msg);
+		return m.find() ? Long.parseLong(m.group(1)) : -1;
 	}
 }
