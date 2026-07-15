@@ -23,6 +23,16 @@
 export SYSDS_QUIET=1
 export SYSTEMDS_STANDALONE_OPTS="-Xmx8g -Xms1g -Xmn256m"
 
+# use THIS repo's built systemds, not whatever 'systemds' is on PATH
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SYSTEMDS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SYSTEMDS="${SYSTEMDS_BIN:-$SYSTEMDS_ROOT/bin/systemds}"
+if [[ ! -x "$SYSTEMDS" ]]; then
+    echo "ERROR: launcher not found/executable: $SYSTEMDS" >&2
+    exit 1
+fi
+echo "Using SYSTEMDS_ROOT=$SYSTEMDS_ROOT"
+
 # stop the federated worker and drop the regenerated scratch on exit (CLEAN=0 keeps ./tmp)
 CLEAN=${CLEAN:-1}
 cleanup() {
@@ -31,7 +41,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-systemds WORKER 50505 \
+"$SYSTEMDS" WORKER 50505 \
     --config ./SystemDS-config.xml \
     --exec singlenode \
     -stats &
@@ -42,7 +52,7 @@ COLS=${COLS:-30000}
 MIN=${MIN:-0}
 MAX=${MAX:-1}
 DATA=${DATA:-"./tmp/X"}
-systemds -f ./genRandData.dml \
+"$SYSTEMDS" -f ./genRandData.dml \
     --nvargs rows=$ROWS cols=$COLS min=$MIN max=$MAX target=$DATA
 
 NUMFED=1
@@ -51,13 +61,13 @@ if [ ! -d ./tmp/hosts ]; then mkdir -p ./tmp/hosts ; fi
 echo "localhost:50505" > ./tmp/hosts/0_null
 echo "{\"data_type\": \"scalar\", \"value_type\": \"string\", \"format\": \"text\"}" > ./tmp/hosts/0_null.mtd
 FED_DATA="${DATA}_fed.json"
-systemds -f ./splitAndMakeFederated.dml \
+"$SYSTEMDS" -f ./splitAndMakeFederated.dml \
     --config ./SystemDS-config.xml \
     --nvargs data=$DATA nSplit=$NUMFED transposed=FALSE \
     target=$FED_DATA hosts="./tmp/hosts" fmt="csv" hostOffset=0
 
 SCRIPT=${SCRIPT:-"./ewSumIx90.dml"}
-systemds -f $SCRIPT \
+"$SYSTEMDS" -f $SCRIPT \
       --exec singlenode \
       --config ./SystemDS-config.xml \
       --stats \
